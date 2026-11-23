@@ -149,6 +149,47 @@ class GlyphsToQuadraticTest(object):
         glyphs_to_quadratic(glyphs, max_err=[4.096, 4.096], stats=stats)
         assert stats == {"2": 11, "3": 1}
 
+    @pytest.mark.parametrize(
+        "max_err, expected_point_counts",
+        [
+            pytest.param([0.5, 4.0], [[33, 34], [33, 34]], id="heterogeneous"),
+            pytest.param([4.0, 4.0], [[23, 23], [23, 23]], id="uniform"),
+        ],
+    )
+    def test_max_err_list_keeps_glyphs_interpolatable(
+        self, fonts, max_err, expected_point_counts
+    ):
+        """Per-font tolerances must not desynchronise the shared topology: the
+        same-named glyphs end up with the same number of points, even though
+        each font is converted with its own ``max_err``."""
+        glyphs = [f["a"] for f in fonts]
+        assert glyphs_to_quadratic(glyphs, max_err=max_err)
+        point_counts = [[len(contour) for contour in glyph] for glyph in glyphs]
+        assert point_counts == expected_point_counts
+        assert point_counts[0] == point_counts[1]
+
+    def test_max_err_list_matches_single_glyph_conversion(self, fonts):
+        """Where a font's own tolerance is the binding one, its glyph keeps the
+        result it would get when converted on its own; the counterpart is the
+        one that is resplit.  Either way the point counts agree."""
+        glyphs = [f["a"] for f in fonts]
+        glyphs_to_quadratic(glyphs, max_err=[0.5, 4.0])
+        regular_counts = [len(contour) for contour in glyphs[0]]
+
+        # Convert each master on its own, from a pristine copy of the font.
+        alone = []
+        for ufo_path, max_err in zip(TEST_UFOS, [0.5, 4.0]):
+            font = ufoLib2.Font.open(ufo_path)
+            glyph_to_quadratic(font["a"], max_err=max_err)
+            alone.append([len(contour) for contour in font["a"]])
+
+        # The regular master is the binding one, so its glyph is unchanged.
+        assert regular_counts == alone[0]
+        # The bold master is resplit along the regular's topology (which is
+        # bigger than the one it would use alone) so both are interpolatable.
+        assert [len(contour) for contour in glyphs[1]] == regular_counts
+        assert alone[1] != regular_counts
+
     def test_reject_zero_tolerance(self, fonts):
         glyphs = [f["a"] for f in fonts]
         with pytest.raises(ValueError, match="must be greater than zero"):
