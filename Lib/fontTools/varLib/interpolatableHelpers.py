@@ -2,6 +2,7 @@ from fontTools.ttLib.ttGlyphSet import LerpGlyphSet
 from fontTools.pens.basePen import AbstractPen, BasePen, DecomposingPen
 from fontTools.pens.pointPen import AbstractPointPen, SegmentToPointPen
 from fontTools.pens.recordingPen import RecordingPen, DecomposingRecordingPen
+from fontTools.pens.componentExpansionPen import ContourSource
 from fontTools.misc.transform import Transform
 from fontTools.misc.fixedTools import floatToFixedToStr, nearestMultipleShortestRepr
 from fontTools.misc.treeTools import minimum_spanning_tree
@@ -212,9 +213,105 @@ class PerContourPen(BasePen):
 
 
 class PerContourOrComponentPen(PerContourPen):
+    def __init__(
+        self,
+        Pen,
+        glyphset=None,
+        expand_components=None,
+        *,
+        selected_components=None,
+        components_to_expand=None,
+        reverseFlipped=False,
+        **kwargs,
+    ):
+        super().__init__(Pen, glyphset)
+        selector = (
+            expand_components
+            if expand_components is not None
+            else components_to_expand
+            if components_to_expand is not None
+            else selected_components
+        )
+        self.expand_components = selector
+        self.reverseFlipped = reverseFlipped
+        # One provenance record per item in ``self.value``.
+        self.sources = []
+        self.contour_sources = self.sources
+        self._source_stack = []
+        self._component_count = 0
+
+    def _newItem(self):
+        super()._newItem()
+        if self._source_stack:
+            frame = self._source_stack[-1]
+            source = ContourSource(
+                glyph_name=frame["glyph_name"],
+                component=frame["component"],
+                transformation=frame["transformation"],
+                component_index=frame["component_index"],
+                contour_index=frame["contour_index"],
+            )
+            frame["contour_index"] += 1
+        else:
+            source = None
+        self.sources.append(source)
+        try:
+            self.value[-1].source = source
+        except (AttributeError, TypeError):
+            pass
+
+    def _component_selected(self, glyphName, transformation, index):
+        selector = self.expand_components
+        if selector is None or selector is False:
+            return False
+        if selector is True:
+            return True
+        if callable(selector):
+            try:
+                return bool(selector(glyphName, transformation))
+            except TypeError:
+                return bool(selector(glyphName, transformation, index))
+        if isinstance(selector, str):
+            return selector == glyphName
+        if isinstance(selector, int):
+            return selector == index
+        try:
+            return glyphName in selector or index in selector
+        except TypeError:
+            return glyphName in selector
+
     def addComponent(self, glyphName, transformation):
-        self._newItem()
-        self.value[-1].addComponent(glyphName, transformation)
+        index = self._component_count
+        self._component_count += 1
+        if self._component_selected(glyphName, transformation, index):
+            self._source_stack.append(
+                {
+                    "glyph_name": glyphName,
+                    "component": glyphName,
+                    "transformation": tuple(transformation),
+                    "component_index": index,
+                    "contour_index": 0,
+                }
+            )
+            try:
+                DecomposingPen.addComponent(self, glyphName, transformation)
+            finally:
+                self._source_stack.pop()
+        else:
+            self._newItem()
+            self.value[-1].addComponent(glyphName, transformation)
+            self.sources[-1] = ContourSource(
+                glyph_name=glyphName,
+                component=glyphName,
+                transformation=tuple(transformation),
+                component_index=index,
+                contour_index=0,
+                reason="component_reference",
+            )
+            try:
+                self.value[-1].source = self.sources[-1]
+            except (AttributeError, TypeError):
+                pass
 
 
 class SimpleRecordingPointPen(AbstractPointPen):

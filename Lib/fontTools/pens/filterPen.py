@@ -186,9 +186,59 @@ class FilterPointPen(_PassThruComponentsMixin, AbstractPointPen):
 class _DecomposingFilterMixinBase:
     """Base mixin class with common `addComponent` logic for decomposing filter pens."""
 
+    def _init_source_tracking(self):
+        # One entry per output contour.  Direct contours and pass-through
+        # components that do not emit contours yet are represented by None or
+        # by component records in ``component_sources``.
+        self.contour_sources = []
+        self.sources = self.contour_sources
+        self.component_sources = []
+        self._source_stack = []
+        self._component_count = 0
+
+    def _push_component_source(self, glyphName, transformation, kwargs):
+        source = {
+            "glyph_name": glyphName,
+            "component": glyphName,
+            "transformation": tuple(transformation),
+            "component_index": self._component_count,
+            "contour_index": 0,
+        }
+        self._component_count += 1
+        self.component_sources.append(source)
+        self._source_stack.append(source)
+        return source
+
+    def _pop_component_source(self):
+        if self._source_stack:
+            self._source_stack.pop()
+
+    def _begin_source_contour(self):
+        if self._source_stack:
+            self._source_stack[-1]["active"] = True
+
+    def _end_source_contour(self):
+        if self._source_stack:
+            frame = self._source_stack[-1]
+            self.contour_sources.append(
+                {
+                    "glyph_name": frame["glyph_name"],
+                    "component": frame["component"],
+                    "transformation": frame["transformation"],
+                    "component_index": frame["component_index"],
+                    "contour_index": frame["contour_index"],
+                }
+            )
+            frame["contour_index"] += 1
+        else:
+            self.contour_sources.append(None)
+
     def addComponent(self, baseGlyphName, transformation, **kwargs):
         # only decompose the component if it's included in the set
         if self.include is None or baseGlyphName in self.include:
+            source = self._push_component_source(
+                baseGlyphName, transformation, kwargs
+            )
             # if we're decomposing nested components, temporarily set include to None
             include_bak = self.include
             if self.decomposeNested and self.include:
@@ -198,7 +248,18 @@ class _DecomposingFilterMixinBase:
             finally:
                 if self.include != include_bak:
                     self.include = include_bak
+                self._pop_component_source()
         else:
+            self._component_count += 1
+            self.component_sources.append(
+                {
+                    "glyph_name": baseGlyphName,
+                    "component": baseGlyphName,
+                    "transformation": tuple(transformation),
+                    "component_index": self._component_count - 1,
+                    "component_reference": True,
+                }
+            )
             _PassThruComponentsMixin.addComponent(
                 self, baseGlyphName, transformation, **kwargs
             )
@@ -252,6 +313,7 @@ class _DecomposingFilterPenMixin(_DecomposingFilterMixinBase):
         )
         self.include = include
         self.decomposeNested = decomposeNested
+        self._init_source_tracking()
 
 
 class _DecomposingFilterPointPenMixin(_DecomposingFilterMixinBase):
@@ -298,12 +360,23 @@ class _DecomposingFilterPointPenMixin(_DecomposingFilterMixinBase):
         )
         self.include = include
         self.decomposeNested = decomposeNested
+        self._init_source_tracking()
 
 
 class DecomposingFilterPen(_DecomposingFilterPenMixin, DecomposingPen, FilterPen):
     """Filter pen that draws components as regular contours."""
 
-    pass
+    def moveTo(self, pt):
+        self._begin_source_contour()
+        super().moveTo(pt)
+
+    def closePath(self):
+        super().closePath()
+        self._end_source_contour()
+
+    def endPath(self):
+        super().endPath()
+        self._end_source_contour()
 
 
 class DecomposingFilterPointPen(
@@ -311,7 +384,13 @@ class DecomposingFilterPointPen(
 ):
     """Filter point pen that draws components as regular contours."""
 
-    pass
+    def beginPath(self, identifier=None, **kwargs):
+        self._begin_source_contour()
+        super().beginPath(identifier=identifier, **kwargs)
+
+    def endPath(self):
+        super().endPath()
+        self._end_source_contour()
 
 
 class ContourFilterPointPen(_PassThruComponentsMixin, AbstractPointPen):

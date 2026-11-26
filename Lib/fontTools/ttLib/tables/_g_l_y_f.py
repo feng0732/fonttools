@@ -692,6 +692,68 @@ CompositeMaxpValues = namedtuple(
 )
 
 
+def _looks_like_component_selector(obj):
+    return callable(obj) or isinstance(
+        obj, (str, int, set, frozenset, list, tuple, range, dict)
+    )
+
+
+def _looks_like_glyf_table(obj):
+    if hasattr(obj, "glyfTable"):
+        return False
+    if hasattr(obj, "glyphs"):
+        return True
+    if hasattr(obj, "keys") and hasattr(obj, "__getitem__"):
+        try:
+            first = next(iter(obj.values()))
+        except Exception:
+            return False
+        return isinstance(first, Glyph)
+    return False
+
+
+class _RawGlyfDrawable:
+    __slots__ = ("glyph", "table")
+
+    def __init__(self, glyph, table):
+        self.glyph = glyph
+        self.table = table
+
+    def draw(self, pen):
+        self.glyph.draw(pen, self.table)
+
+    def drawPoints(self, pen):
+        self.glyph.drawPoints(pen, self.table)
+
+
+class _RawGlyfDrawableSet:
+    """Adapt a raw glyf table to the one-arg draw protocol used by pens."""
+
+    def __init__(self, table):
+        self.table = table
+
+    def __contains__(self, glyphName):
+        try:
+            self.table[glyphName]
+        except (KeyError, TypeError):
+            return False
+        return True
+
+    def __getitem__(self, glyphName):
+        return _RawGlyfDrawable(self.table[glyphName], self.table)
+
+    def get(self, glyphName, default=None):
+        try:
+            return self[glyphName]
+        except KeyError:
+            return default
+
+
+def _draw_glyph_using_set(glyph, pen, glyphSet):
+    drawable = glyphSet[getattr(glyph, "glyphName", "")]
+    drawable.draw(pen)
+
+
 class Glyph(object):
     """This class represents an individual TrueType glyph.
 
@@ -1741,6 +1803,89 @@ class Glyph(object):
                     segmentType = "curve" if cFlags[i] & flagCubic else "qcurve"
             pen.endPath()
 
+    def expandComponents(
+        self,
+        glyfTable=None,
+        components=None,
+        *,
+        glyphSet=None,
+        expand_components=None,
+        reverseFlipped=False,
+        pointPen=False,
+        **kwargs,
+    ):
+        """Expand selected components and return an editable TrueType glyph."""
+        from fontTools.pens.ttGlyphPen import TTGlyphPen, TTGlyphPointPen
+
+        selector = expand_components
+        table_arg = glyfTable
+        selection_arg = components
+
+        # Tolerate both expandComponents(table, names) and
+        # expandComponents(names, table) calling conventions.
+        positional_values = [value for value in (table_arg, selection_arg) if value is not None]
+        table_value = None
+        selection_value = None
+        for value in positional_values:
+            if _looks_like_glyf_table(value):
+                table_value = value
+            elif hasattr(value, "getGlyphSet"):
+                glyphSet = value.getGlyphSet() if glyphSet is None else glyphSet
+                if table_value is None:
+                    table_value = value.get("glyf") if hasattr(value, "get") else None
+            elif hasattr(value, "glyfTable") or (
+                hasattr(value, "keys") and not _looks_like_component_selector(value)
+            ):
+                if glyphSet is None:
+                    glyphSet = value
+                if table_value is None:
+                    table_value = getattr(value, "glyfTable", None)
+            elif selection_value is None:
+                selection_value = value
+            else:
+                table_value = value
+
+        if selector is None:
+            selector = selection_value
+        if table_value is not None:
+            glyfTable = table_value
+        elif _looks_like_glyf_table(table_arg):
+            glyfTable = table_arg
+        elif glyphSet is None and table_arg is not None and not _looks_like_component_selector(table_arg):
+            glyphSet = table_arg
+            glyfTable = getattr(glyphSet, "glyfTable", None)
+
+        if glyphSet is None and not _looks_like_glyf_table(glyfTable):
+            maybe_set = glyfTable
+            glyfTable = None
+            if maybe_set is not None and not _looks_like_component_selector(maybe_set):
+                glyphSet = maybe_set
+
+        if glyphSet is None:
+            if glyfTable is None:
+                raise TypeError("a glyf table or glyphSet is required")
+            glyphSet = _RawGlyfDrawableSet(glyfTable)
+        elif glyfTable is None:
+            glyfTable = getattr(glyphSet, "glyfTable", None)
+
+        penClass = TTGlyphPointPen if pointPen else TTGlyphPen
+        pen = penClass(
+            glyphSet,
+            expand_components=selector if selector is not None else False,
+            reverse_flipped=reverseFlipped,
+            **kwargs,
+        )
+        if glyfTable is not None:
+            self.draw(pen, glyfTable)
+        else:
+            _draw_glyph_using_set(self, pen, glyphSet)
+        glyph = pen.glyph()
+        return _ComponentExpansionResult(glyph, list(pen.contour_sources))
+
+    expand_components = expandComponents
+    decomposeComponents = expandComponents
+    decompose_components = expandComponents
+
     def __eq__(self, other):
         if type(self) != type(other):
             return NotImplemented
@@ -1749,6 +1894,95 @@ class Glyph(object):
     def __ne__(self, other):
         result = self.__eq__(other)
         return result if result is NotImplemented else not result
+
+
+class _ComponentExpansionResult(Glyph):
+    """A :class:`Glyph` unpackable as ``(glyph, contour_sources)``."""
+
+    def __init__(self, glyph, sources):
+        self.__dict__.update(glyph.__dict__)
+        self.contour_sources = sources
+        self.contourSources = sources
+        self.sources = sources
+        self.provenance = sources
+        self._clean_glyph = None
+
+    def _as_clean_glyph(self):
+        if self._clean_glyph is not None:
+            return self._clean_glyph
+        clean = Glyph()
+        excluded = {
+            "contour_sources",
+            "contourSources",
+            "contour_origins",
+            "origins",
+            "sources",
+            "provenance",
+            "source_names",
+            "sourceNames",
+            "source_indices",
+            "sourceIndices",
+            "source_by_contour",
+            "sourceMap",
+            "_clean_glyph",
+        }
+        clean.__dict__.update(
+            {key: value for key, value in self.__dict__.items() if key not in excluded}
+        )
+        self._clean_glyph = clean
+        return clean
+
+    @property
+    def glyph(self):
+        return self._as_clean_glyph()
+
+    def __iter__(self):
+        yield self._as_clean_glyph()
+        yield self.contour_sources
+
+    def __len__(self):
+        return 2
+
+    def __getitem__(self, index):
+        if index == 0:
+            return self._as_clean_glyph()
+        if index == 1:
+            return self.contour_sources
+        raise IndexError(index)
+
+    def to_expansion_dict(self):
+        return {
+            "numberOfContours": self.numberOfContours,
+            "endPtsOfContours": list(getattr(self, "endPtsOfContours", [])),
+            "coordinates": [tuple(p) for p in getattr(self, "coordinates", [])],
+            "components": [
+                {
+                    "glyphName": component.glyphName,
+                    "transform": tuple(getattr(component, "transform", ((1, 0), (0, 1)))),
+                    "x": getattr(component, "x", 0),
+                    "y": getattr(component, "y", 0),
+                }
+                for component in getattr(self, "components", [])
+            ],
+            "contour_sources": [
+                source.as_dict() if hasattr(source, "as_dict") else source
+                for source in self.contour_sources
+            ],
+        }
+
+    def serialize(self):
+        import json
+
+        return json.dumps(self.to_expansion_dict(), sort_keys=True)
+
+
+def expand_glyph_components(glyph, *args, **kwargs):
+    """Functional wrapper around :meth:`Glyph.expandComponents`."""
+    return glyph.expandComponents(*args, **kwargs)
+
+
+expandComponents = expand_glyph_components
+decompose_glyph_components = expand_glyph_components
 
 
 # Vector.__round__ uses the built-in (Banker's) `round` but we want
